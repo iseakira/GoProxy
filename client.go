@@ -80,10 +80,11 @@ func handleBrowser(browserConn net.Conn) {
 	tlsConn.Read(resp)
 	if string(resp[:2]) != "OK" {
 		log.Println("サーバーエラー")
+		return
 	}
 
 	if len(request) > 7 && request[:7] == "CONNECT" {
-		browserConn.Write([]byte("HTTP1.1 200 Connection EStablished\r\nr\n"))
+		browserConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
 	} else {
 		tlsConn.Write(buf[:n])
 	}
