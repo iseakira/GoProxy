@@ -2,10 +2,26 @@ package main
 
 import (
 	"crypto/tls"
+	"encoding/json"
 	"io"
 	"log"
 	"net"
+	"net/http"
 )
+
+type ProxyRequest struct {
+	Method  string            `json:"method"`
+	Host    string            `json:"host"`
+	Path    string            `json:"path"`
+	Headers map[string]string `json:"headers"`
+	Body    string            `json:"body"`
+}
+
+type ProxyResponse struct {
+	Status  int               `json:"status"`
+	Headers map[string]string `json:"headers"`
+	Body    string            `json:"body"`
+}
 
 func main() {
 	//TLS証明書を読み込む
@@ -39,29 +55,71 @@ func main() {
 }
 
 
-//
 func handleConn(clientConn net.Conn){
 	defer clientConn.Close()
 
-	buf := make([]byte,256)
-	n,err := clientConn.Read(buf)//clientconnからデータ受け取り
-	if err != nil {
+	decoder := json.NewDecoder(clientConn)
+	encoder := json.NewEncoder(clientConn)
+
+	var req ProxyRequest
+	if err := decoder.Decode(&req); err != nil {
+		log.Println("リクエスト解析エラー:",err)
 		return
 	}
-	target := string(buf[:n])
-	log.Println("接続要求：",target)
 
-	targetConn,err := net.Dial("tcp",target)
+	log.Println("[サーバー] クライアントからリクエスト受信:")
+	log.Printf("  Method: %s, Host: %s, Path: %s\n", req.Method, req.Host, req.Path)
 
+	// 実際のHTTPリクエストを実行
+	resp, err := executeRequest(&req)
 	if err != nil {
-		log.Println("接続失敗:",target,err)
-		clientConn.Write([]byte("ERROR"))
+		log.Println("リクエスト実行エラー:", err)
+		encoder.Encode(ProxyResponse{Status: 500, Body: "Error"})
 		return
 	}
-	defer targetConn.Close()
 
-	clientConn.Write([]byte("OK"))
+	log.Printf("[サーバー] レスポンス送信: ステータス %d\n", resp.Status)
+	// レスポンスをクライアントに送信
+	encoder.Encode(resp)
+}
 
-	go io.Copy(targetConn,clientConn)//client→web
-	io.Copy(clientConn,targetConn)//web→client
+func executeRequest(req *ProxyRequest) (*ProxyResponse, error) {
+	url := "http://" + req.Host + req.Path
+
+	httpReq, err := http.NewRequest(req.Method, url, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	// ヘッダを設定
+	for key, value := range req.Headers {
+		httpReq.Header.Set(key, value)
+	}
+
+	client := &http.Client{}
+	httpResp, err := client.Do(httpReq)
+	if err != nil {
+		return nil, err
+	}
+	defer httpResp.Body.Close()
+
+	// レスポンスボディを読む
+	body, err := io.ReadAll(httpResp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	// ヘッダを辞書に変換
+	headers := make(map[string]string)
+	for key, values := range httpResp.Header {
+		if len(values) > 0 {
+			headers[key] = values[0]
+		}
+	}
+
+	return &ProxyResponse{
+		Status:  httpResp.StatusCode,
+		Headers: headers,
+		Body:    string(body),
+	}, nil
 }

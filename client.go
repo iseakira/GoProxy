@@ -1,16 +1,33 @@
 package main
 
 import (
+	"bufio"
 	"crypto/tls"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net"
+	"net/http"
 	"strings"
 )
 
+type ProxyRequest struct {
+	Method  string            `json:"method"`
+	Host    string            `json:"host"`
+	Path    string            `json:"path"`
+	Headers map[string]string `json:"headers"`
+	Body    string            `json:"body"`
+}
+
+type ProxyResponse struct {
+	Status  int               `json:"status"`
+	Headers map[string]string `json:"headers"`
+	Body    string            `json:"body"`
+}
+
 func main() {
-	//ブラウザからHTTP1プロキシるクエストを待ち受け
+	//ブラウザからHTTPプロキシリクエストを待ち受け
 	listener, err := net.Listen("tcp",":8080")
 
 	if err != nil {
@@ -32,63 +49,90 @@ func main() {
 func handleBrowser(browserConn net.Conn) {
 	defer browserConn.Close()
 
-	buf := make([]byte,4096)
-	n,err := browserConn.Read(buf)
+	reader := bufio.NewReader(browserConn)
+	httpReq, err := http.ReadRequest(reader)
 	if err != nil {
+		log.Println("HTTPリクエスト解析エラー:", err)
 		return
 	}
-	request := string(buf[:n])
 
-
-	var target string
-
-	if len(request) > 7 && request[:7] == "CONNECT" {
-		var method, host, proto string
-		fmt.Sscanf(request,"%s %s %s",&method,&host,&proto)
-		target = host
-	}else {
-		for _, line := range strings.Split(request,"\r\n"){
-			if strings.HasPrefix(line,"Host:") {
-				target = strings.TrimPrefix(line,"Host: ") + ":80"
-				break
-			}
+	// リクエスト情報を抽出
+	host := httpReq.Host
+	if !strings.Contains(host, ":") {
+		if httpReq.URL.Scheme == "https" {
+			host = host + ":443"
+		} else {
+			host = host + ":80"
 		}
 	}
 
-	if target == "" {
-		log.Println("接続先不明")
-		return
+	// ボディを読む
+	body := ""
+	if httpReq.Body != nil {
+		bodyBytes, err := io.ReadAll(httpReq.Body)
+		if err == nil {
+			body = string(bodyBytes)
+		}
 	}
 
-	log.Println("接続要求:",target)
+	// ヘッダを辞書に変換（Host除外）
+	headers := make(map[string]string)
+	for key, values := range httpReq.Header {
+		if key != "Host" && len(values) > 0 {
+			headers[key] = values[0]
+		}
+	}
 
-	//server.goにTLSで接続
+	proxyReq := ProxyRequest{
+		Method:  httpReq.Method,
+		Host:    strings.Split(host, ":")[0], // ホスト名のみ
+		Path:    httpReq.URL.RequestURI(),
+		Headers: headers,
+		Body:    body,
+	}
 
+	log.Println("接続要求:", proxyReq.Method, proxyReq.Host, proxyReq.Path)
+
+	// サーバーにTLSで接続
 	tlsConn, err := tls.Dial("tcp", "localhost:9000", &tls.Config{
 		InsecureSkipVerify: true,
 	})
 
 	if err != nil {
 		log.Println("サーバーへの接続失敗:",err)
+		browserConn.Write([]byte("HTTP/1.1 500 Internal Server Error\r\n\r\n"))
 		return
 	}
 	defer tlsConn.Close()
 
-	tlsConn.Write([]byte(target))
-
-	resp := make([]byte, 10)
-	tlsConn.Read(resp)
-	if string(resp[:2]) != "OK" {
-		log.Println("サーバーエラー")
+	// JSONでリクエストを送信
+	encoder := json.NewEncoder(tlsConn)
+	log.Println("[クライアント] サーバーへリクエスト送信:")
+	log.Printf("  Method: %s, Host: %s, Path: %s\n", proxyReq.Method, proxyReq.Host, proxyReq.Path)
+	if err := encoder.Encode(&proxyReq); err != nil {
+		log.Println("リクエスト送信エラー:", err)
 		return
 	}
 
-	if len(request) > 7 && request[:7] == "CONNECT" {
-		browserConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
-	} else {
-		tlsConn.Write(buf[:n])
+	// レスポンスを受信
+	decoder := json.NewDecoder(tlsConn)
+	var proxyResp ProxyResponse
+	if err := decoder.Decode(&proxyResp); err != nil {
+		log.Println("レスポンス受信エラー:", err)
+		browserConn.Write([]byte("HTTP/1.1 500 Internal Server Error\r\n\r\n"))
+		return
 	}
 
-	go io.Copy(tlsConn,browserConn)
-	io.Copy(browserConn,tlsConn)
+	log.Printf("[クライアント] サーバーからレスポンス受信: ステータス %d\n", proxyResp.Status)
+
+	// HTTPレスポンスをブラウザに送信
+	respLine := fmt.Sprintf("HTTP/1.1 %d %s\r\n", proxyResp.Status, http.StatusText(proxyResp.Status))
+	browserConn.Write([]byte(respLine))
+
+	for key, value := range proxyResp.Headers {
+		browserConn.Write([]byte(key + ": " + value + "\r\n"))
+	}
+
+	browserConn.Write([]byte("\r\n"))
+	browserConn.Write([]byte(proxyResp.Body))
 }

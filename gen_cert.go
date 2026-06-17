@@ -14,6 +14,17 @@ import (
 
 func main() {
 
+	// certs フォルダと証明書ファイルの確認
+	if _, err := os.Stat("certs/server.crt"); err == nil {
+		if _, err := os.Stat("certs/server.key"); err == nil {
+			println("証明書は既に存在します")
+			return
+		}
+	}
+
+	// certsディレクトリがなければ作成
+	os.MkdirAll("certs", 0755)
+
 	//秘密鍵の生成
 	private, err := ecdsa.GenerateKey(elliptic.P256(),rand.Reader)
 	if err != nil {
