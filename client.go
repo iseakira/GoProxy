@@ -3,136 +3,106 @@ package main
 import (
 	"bufio"
 	"crypto/tls"
-	"encoding/json"
-	"fmt"
 	"io"
 	"log"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 )
 
-type ProxyRequest struct {
-	Method  string            `json:"method"`
-	Host    string            `json:"host"`
-	Path    string            `json:"path"`
-	Headers map[string]string `json:"headers"`
-	Body    string            `json:"body"`
-}
-
-type ProxyResponse struct {
-	Status  int               `json:"status"`
-	Headers map[string]string `json:"headers"`
-	Body    string            `json:"body"`
-}
+var serverAddr string
 
 func main() {
-	//ブラウザからHTTPプロキシリクエストを待ち受け
-	listener, err := net.Listen("tcp",":8080")
-
-	if err != nil {
-		log.Fatal("起動失敗:",err)
+	// サーバーアドレスを環境変数から取得（デフォルト: localhost:9000）
+	serverAddr = os.Getenv("VPN_SERVER")
+	if serverAddr == "" {
+		serverAddr = "localhost:9000"
 	}
 
-	log.Println("プロキシクライアント起動 :8080")
+	log.Printf("VPNサーバー: %s\n", serverAddr)
+
+	// HTTPプロキシをリッスン
+	listener, err := net.Listen("tcp", ":8080")
+	if err != nil {
+		log.Fatal("起動失敗:", err)
+	}
+
+	log.Println("VPNクライアント起動 :8080 (HTTPプロキシ)")
 
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
-			log.Println("接続エラー",err)
+			log.Println("接続エラー", err)
 			continue
 		}
-		go handleBrowser(conn)
+		go handleHTTPProxy(conn)
 	}
 }
 
-func handleBrowser(browserConn net.Conn) {
-	defer browserConn.Close()
+func handleHTTPProxy(clientConn net.Conn) {
+	defer clientConn.Close()
 
-	reader := bufio.NewReader(browserConn)
-	httpReq, err := http.ReadRequest(reader)
+	reader := bufio.NewReader(clientConn)
+
+	// HTTPリクエストを読み込む
+	req, err := http.ReadRequest(reader)
 	if err != nil {
-		log.Println("HTTPリクエスト解析エラー:", err)
+		log.Println("リクエスト解析エラー:", err)
 		return
 	}
 
-	// リクエスト情報を抽出
-	host := httpReq.Host
+	// ホスト名とポート番号を取得
+	host := req.Host
 	if !strings.Contains(host, ":") {
-		if httpReq.URL.Scheme == "https" {
+		if req.Method == "CONNECT" {
 			host = host + ":443"
 		} else {
 			host = host + ":80"
 		}
 	}
 
-	// ボディを読む
-	body := ""
-	if httpReq.Body != nil {
-		bodyBytes, err := io.ReadAll(httpReq.Body)
-		if err == nil {
-			body = string(bodyBytes)
-		}
-	}
-
-	// ヘッダを辞書に変換（Host除外）
-	headers := make(map[string]string)
-	for key, values := range httpReq.Header {
-		if key != "Host" && len(values) > 0 {
-			headers[key] = values[0]
-		}
-	}
-
-	proxyReq := ProxyRequest{
-		Method:  httpReq.Method,
-		Host:    strings.Split(host, ":")[0], // ホスト名のみ
-		Path:    httpReq.URL.RequestURI(),
-		Headers: headers,
-		Body:    body,
-	}
-
-	log.Println("接続要求:", proxyReq.Method, proxyReq.Host, proxyReq.Path)
+	log.Printf("[クライアント] 接続要求: %s %s\n", req.Method, host)
 
 	// サーバーにTLSで接続
-	tlsConn, err := tls.Dial("tcp", "localhost:9000", &tls.Config{
+	tlsConn, err := tls.Dial("tcp", serverAddr, &tls.Config{
 		InsecureSkipVerify: true,
 	})
-
 	if err != nil {
-		log.Println("サーバーへの接続失敗:",err)
-		browserConn.Write([]byte("HTTP/1.1 500 Internal Server Error\r\n\r\n"))
+		log.Println("サーバー接続失敗:", err)
+		clientConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
 		return
 	}
 	defer tlsConn.Close()
 
-	// JSONでリクエストを送信
-	encoder := json.NewEncoder(tlsConn)
-	log.Println("[クライアント] サーバーへリクエスト送信:")
-	log.Printf("  Method: %s, Host: %s, Path: %s\n", proxyReq.Method, proxyReq.Host, proxyReq.Path)
-	if err := encoder.Encode(&proxyReq); err != nil {
-		log.Println("リクエスト送信エラー:", err)
+	// サーバーに接続先を送信
+	tlsConn.Write([]byte(host))
+
+	// サーバーからの応答待機
+	respBuf := make([]byte, 10)
+	n, err := tlsConn.Read(respBuf)
+	if err != nil || n < 2 || string(respBuf[:2]) != "OK" {
+		log.Println("サーバーエラー")
+		clientConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
 		return
 	}
 
-	// レスポンスを受信
-	decoder := json.NewDecoder(tlsConn)
-	var proxyResp ProxyResponse
-	if err := decoder.Decode(&proxyResp); err != nil {
-		log.Println("レスポンス受信エラー:", err)
-		browserConn.Write([]byte("HTTP/1.1 500 Internal Server Error\r\n\r\n"))
-		return
+	log.Println("[クライアント] サーバー接続成功")
+
+	// CONNECTメソッドの場合
+	if req.Method == "CONNECT" {
+		// 200 Connection Establishedを返す
+		clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
+		log.Println("[クライアント] CONNECT トンネル確立")
+	} else {
+		// 通常のHTTPリクエストをサーバーに転送
+		req.RequestURI = ""
+		req.Write(tlsConn)
 	}
 
-	log.Printf("[クライアント] サーバーからレスポンス受信: ステータス %d\n", proxyResp.Status)
+	log.Println("[クライアント] データ転送開始")
 
-	// HTTPレスポンスをブラウザに送信
-	respLine := fmt.Sprintf("HTTP/1.1 %d %s\r\n", proxyResp.Status, http.StatusText(proxyResp.Status))
-	browserConn.Write([]byte(respLine))
-
-	for key, value := range proxyResp.Headers {
-		browserConn.Write([]byte(key + ": " + value + "\r\n"))
-	}
-
-	browserConn.Write([]byte("\r\n"))
-	browserConn.Write([]byte(proxyResp.Body))
+	// ブラウザとサーバー間でバイナリデータを双方向転送
+	go io.Copy(tlsConn, clientConn)
+	io.Copy(clientConn, tlsConn)
 }
